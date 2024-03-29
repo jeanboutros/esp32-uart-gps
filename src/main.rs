@@ -1,12 +1,12 @@
 use std::ffi::{c_void, CStr, CString};
+use std::hash::Hash;
 use std::ops::Deref;
+
 /*
 GPIOs not recommended to be used:
 6 - 11, 16 - 17
 src: https://docs.rs/crate/esp-idf-hal/latest
  */
-use enumset::*;
-use std::ptr::{null, null_mut};
 use esp_idf_hal::cpu::Core;
 use esp_idf_hal::delay::NON_BLOCK;
 use esp_idf_svc::sys::SOC_UART_FIFO_LEN;
@@ -20,19 +20,53 @@ use esp_idf_svc::hal::{
     delay::FreeRtos,
     task::*
 };
+use std::collections::HashMap;
+mod nmea;
+use nmea::nmea::message::{parse_message_type_code, GGA, NmeaMessageTypeCode, NmeaMessage};
 
 const GPS_READ_BUFFER_SIZE: usize = 1024;
 
+struct Nmea<'a> {
+    value: &'a mut i32,
+}
+impl<'a> Nmea<'a>  {
+    fn new(value: &'a mut i32) -> Self {
+        Nmea { value }
+    }
+}
 #[repr(C)] 
 struct UartDriverDetails<'a> {
     driver: &'a UartDriver<'a>,
+    nmea_parser: &'a mut Nmea<'a>,
+    nmea_message_stats: &'a mut HashMap<String, u32>,
 }
 
-fn process_gps_message(message: &str) {
-    log::info!("**** Full message recived... Processing {}", message);
+
+     
+
+fn process_gps_message(message: &str, uart_gps_driver_details: &mut UartDriverDetails) {
+    log::debug!("**** Full message recived... Processing {}", message);
+    *uart_gps_driver_details.nmea_parser.value += 1;
+    
+    {
+        let stat = (uart_gps_driver_details).nmea_message_stats.entry(message[1..6].to_string()).or_insert(0);
+        *stat += 1;
+    }
+
+    // let message_talker_id = message[1..3];
+    // let message_type_code: &str = &message[3..6];
+    match parse_message_type_code(message) {
+        NmeaMessageTypeCode::GGA => { 
+            log::debug!("Processing {}", message);
+            let a = GGA::parse(message);
+            log::info!("Parsed message: {:#?}", a);
+        }
+        _ => {}
+    }
+    
 }
 
-fn concatenate_uart_rx_messages(latest_uart_string: &String, leftover_uart_string: &String) -> String {
+fn concatenate_uart_rx_messages(latest_uart_string: &String, leftover_uart_string: &String, uart_gps_driver_details: &mut UartDriverDetails) -> String {
     let binding = String::from_iter(vec![leftover_uart_string.clone(), latest_uart_string.clone()]);
     let split_messages = binding.split_terminator("\r\n");
     let new_latest_uart_string: Vec<&str> = split_messages.collect();
@@ -60,7 +94,7 @@ fn concatenate_uart_rx_messages(latest_uart_string: &String, leftover_uart_strin
         .iter()
         .take(num_messages_to_process)
         .into_iter()
-        .for_each(|message| process_gps_message(message));
+        .for_each(|message| process_gps_message(message, uart_gps_driver_details));
     
     return lef.to_owned()
 }
@@ -94,12 +128,13 @@ fn read_uart_rx_buffer<'a>(uart_driver: &'a UartDriver<'a>, read_buf: &'a mut [u
 }
 
 extern "C" fn uart_gps_task_handler(args: *mut c_void) {
-    let uart_gps_driver_details = unsafe {
+    let mut uart_gps_driver_details = unsafe {
         // Safely create a reference from the raw pointer
-        &*(args as *const UartDriverDetails)
+        &mut *(args as *mut UartDriverDetails)
     };
 
     let uart_driver = uart_gps_driver_details.driver;
+    // let &mut nmea_parser = uart_gps_driver_details.nmea_parser;
 
     // log::info!("uart_gps_driver_details: {}", uart_driver.baudrate().unwrap());
 
@@ -126,7 +161,8 @@ extern "C" fn uart_gps_task_handler(args: *mut c_void) {
                         // leftover_string = last_leftover_string;
                         let received_string = read_uart_rx_buffer(&uart_driver, &mut read_buf, &leftover_string).unwrap();
                         // leftover_s
-                        leftover_string = concatenate_uart_rx_messages(&received_string, &leftover_string);
+                        leftover_string = concatenate_uart_rx_messages(&received_string, &leftover_string, 
+                            &mut uart_gps_driver_details);
                     },
                     UartEventPayload::PatternDetected | UartEventPayload::Break  => {
                         log::debug!("Looks like we have a break here!");
@@ -155,15 +191,18 @@ const ACCEPTABLE_CHARS: [u8; 2] = [b'\r', b'\n'];
 fn main() {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
+    log::info!("Patching");
     esp_idf_svc::sys::link_patches();
 
     // Bind the log crate to the ESP Logging facilities
+    log::info!("Starting ESP Logger");
     esp_idf_svc::log::EspLogger::initialize_default();
 
     log::info!("Starting");
     
     let peripherals = Peripherals::take().unwrap();
     let uart_port = peripherals.uart2;
+    
     let tx = peripherals.pins.gpio17;
     let rx = peripherals.pins.gpio18;
     let cts = Option::<AnyIOPin>::None;
@@ -179,29 +218,20 @@ fn main() {
     let uart_gps_driver = UartDriver::new(uart_port, tx, rx, cts, rts, &uart_gps_config).unwrap();
     log::info!("UartDriver Created");
 
-    // let mut read_buf: [u8; GPS_READ_BUFFER_SIZE] = [0; GPS_READ_BUFFER_SIZE];
-    // loop {
-    //     match uart_gps_driver.read(&mut read_buf, NON_BLOCK) {
-    //         Ok(bytes_read) => {
-    //             let s = read_buf.iter()
-    //             .filter(|&b| *b >= 32 && *b <= 126 || ACCEPTABLE_CHARS.contains(b))  // Filter for printable ASCII characters (32-126)
-    //             .map(|&b| b as char)  // Convert bytes to chars
-    //             .collect::<String>();
+    let mut _a: i32 = 1;
+    let mut nmea_parser = Nmea::new(&mut _a);
+    log::info!("_a is {}", nmea_parser.value);
 
-    //             log::info!("Received: {}", s);
-    //         },
-    //         Err(error) => {log::error!("{}", error);}
-            
-    //     };
-    //     FreeRtos::delay_ms(10);
-    // }
-    
-    log::info!("UartDriver done reading");
+    let mut nmea_message_stats: HashMap<String, u32> = HashMap::new();
 
-    let mut uart_gps_driver_details = UartDriverDetails { driver: &uart_gps_driver };
+    let mut uart_gps_driver_details = UartDriverDetails { 
+        driver: &uart_gps_driver,
+        nmea_parser: &mut nmea_parser,
+        nmea_message_stats: &mut nmea_message_stats
+    };
 
     // uart_gps_driver.
-    let q = uart_gps_driver.event_queue().unwrap();
+    // let q = uart_gps_driver.event_queue().unwrap();
     
     
     unsafe { 
@@ -210,12 +240,13 @@ fn main() {
                                                 UART_GPS_STACK_SIZE, 
                                                 &mut uart_gps_driver_details as *mut _ as *mut c_void,
                                                 UART_GPS_TASK_PRIORITY,
-                                            Option::<Core>::Some(Core::Core0)); 
+                                            Option::<Core>::Some(Core::Core0)); // TODO change the pin to core
     };
 
     loop {
         log::info!("Loopin ZZ main..");
-        FreeRtos::delay_ms(1000);
+        log::info!("{:#?}", uart_gps_driver_details.nmea_message_stats);
+        FreeRtos::delay_ms(3000);
     }
     
 }
